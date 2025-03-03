@@ -1,0 +1,613 @@
+name: Web Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'スクレイピング対象のURL'
+        required: true
+        default: 'https://example.com'
+      max_depth:
+        description: '最大深度 (1-5の範囲推奨)'
+        required: true
+        default: '2'
+      file_types:
+        description: '取得するファイルタイプ (カンマ区切り, 例: html,pdf,jpg)'
+        required: false
+        default: 'html'
+      exclude_patterns:
+        description: '除外パターン (カンマ区切り)'
+        required: false
+        default: ''
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install scrapy requests beautifulsoup4 fastapi uvicorn jinja2 lxml
+
+      - name: Create directories
+        run: |
+          mkdir -p scraped_data
+          mkdir -p templates
+          mkdir -p static/css
+
+      - name: Create scraper script
+        run: |
+          cat > scraper.py << 'EOF'
+          import os
+          import sys
+          import re
+          import json
+          import requests
+          from urllib.parse import urlparse, urljoin
+          from bs4 import BeautifulSoup
+          import time
+          from datetime import datetime
+
+          class WebScraper:
+              def __init__(self, start_url, max_depth=2, allowed_file_types=None, exclude_patterns=None):
+                  self.start_url = start_url
+                  self.base_domain = urlparse(start_url).netloc
+                  self.max_depth = int(max_depth)
+                  self.visited_urls = set()
+                  self.urls_to_visit = [(start_url, 0)]  # (url, depth)
+                  self.downloaded_files = []
+                  self.allowed_file_types = set(allowed_file_types) if allowed_file_types else {'html'}
+                  
+                  # 除外パターンを正規表現として処理
+                  self.exclude_patterns = []
+                  if exclude_patterns:
+                      for pattern in exclude_patterns:
+                          try:
+                              self.exclude_patterns.append(re.compile(pattern))
+                          except re.error:
+                              print(f"無効な正規表現パターン: {pattern}")
+                  
+                  # 出力ディレクトリの設定
+                  self.output_dir = "scraped_data"
+                  os.makedirs(self.output_dir, exist_ok=True)
+                  
+                  # メタデータの初期化
+                  self.metadata = {
+                      "start_url": start_url,
+                      "max_depth": max_depth,
+                      "start_time": datetime.now().isoformat(),
+                      "files_downloaded": 0,
+                      "pages_visited": 0,
+                      "allowed_file_types": list(self.allowed_file_types),
+                      "exclude_patterns": exclude_patterns or []
+                  }
+
+              def should_exclude(self, url):
+                  """URLが除外パターンに一致するか確認"""
+                  for pattern in self.exclude_patterns:
+                      if pattern.search(url):
+                          return True
+                  return False
+
+              def get_file_extension(self, url):
+                  """URLからファイル拡張子を取得"""
+                  path = urlparse(url).path
+                  # パスが / で終わる場合はhtmlと見なす
+                  if path.endswith('/'):
+                      return 'html'
+                  
+                  # 拡張子を取得
+                  ext = os.path.splitext(path)[1].lower()
+                  if ext:
+                      # .から始まる場合は.を除去
+                      ext = ext[1:] if ext.startswith('.') else ext
+                      return ext
+                  
+                  # 拡張子がない場合はhtmlと見なす
+                  return 'html'
+
+              def is_same_domain(self, url):
+                  """URLが同じドメインかどうか確認"""
+                  return urlparse(url).netloc == self.base_domain
+
+              def normalize_url(self, url, base_url):
+                  """相対URLを絶対URLに変換"""
+                  return urljoin(base_url, url)
+              
+              def get_save_path(self, url):
+                  """URLからファイル保存パスを生成"""
+                  parsed = urlparse(url)
+                  path = parsed.path
+                  
+                  # パスが空または / のみの場合はindex.htmlとする
+                  if not path or path == '/':
+                      return os.path.join(self.output_dir, 'index.html')
+                  
+                  # 末尾が / で終わる場合は index.html を追加
+                  if path.endswith('/'):
+                      path = path + 'index.html'
+                  
+                  # クエリパラメータがある場合、ファイル名に追加
+                  if parsed.query:
+                      # 拡張子を保持
+                      name, ext = os.path.splitext(path)
+                      # クエリを短い文字列に変換（長すぎるファイル名を避けるため）
+                      query_hash = str(hash(parsed.query))[-8:]
+                      path = f"{name}_q{query_hash}{ext}"
+                  
+                  # 先頭の / を除去
+                  if path.startswith('/'):
+                      path = path[1:]
+                  
+                  # ファイルパスを作成
+                  full_path = os.path.join(self.output_dir, path)
+                  
+                  # ディレクトリが存在しない場合は作成
+                  os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                  
+                  return full_path
+
+              def download_file(self, url, depth):
+                  """ファイルをダウンロード"""
+                  if url in self.visited_urls:
+                      return
+                  
+                  # URLを訪問済みに追加
+                  self.visited_urls.add(url)
+                  self.metadata["pages_visited"] += 1
+                  
+                  print(f"処理中: {url} (深度: {depth})")
+                  
+                  try:
+                      # ファイルの拡張子を取得
+                      file_ext = self.get_file_extension(url)
+                      
+                      # 許可されたファイルタイプかチェック
+                      if file_ext not in self.allowed_file_types:
+                          print(f"スキップ: {url} (対象外の拡張子: {file_ext})")
+                          return
+                      
+                      # リクエストを送信
+                      headers = {
+                          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                      }
+                      response = requests.get(url, headers=headers, timeout=30)
+                      
+                      # ステータスコードをチェック
+                      if response.status_code != 200:
+                          print(f"エラー: {url} (ステータスコード: {response.status_code})")
+                          return
+                      
+                      # ファイルの保存パスを取得
+                      save_path = self.get_save_path(url)
+                      
+                      # ファイルを保存
+                      with open(save_path, 'wb') as f:
+                          f.write(response.content)
+                      
+                      # ダウンロード情報を記録
+                      file_info = {
+                          "url": url,
+                          "local_path": save_path,
+                          "content_type": response.headers.get('Content-Type', ''),
+                          "size_bytes": len(response.content),
+                          "depth": depth
+                      }
+                      self.downloaded_files.append(file_info)
+                      self.metadata["files_downloaded"] += 1
+                      
+                      print(f"保存完了: {save_path}")
+                      
+                      # HTMLの場合、リンクを抽出
+                      if file_ext == 'html' and depth < self.max_depth:
+                          self.extract_links(url, response.text, depth)
+                      
+                  except Exception as e:
+                      print(f"ダウンロード失敗: {url} ({str(e)})")
+
+              def extract_links(self, url, html_content, current_depth):
+                  """HTMLからリンクを抽出"""
+                  try:
+                      soup = BeautifulSoup(html_content, 'html.parser')
+                      
+                      # <a> タグからリンクを抽出
+                      for a_tag in soup.find_all('a', href=True):
+                          link = a_tag['href']
+                          absolute_link = self.normalize_url(link, url)
+                          
+                          # 同一ドメインのみ、訪問済みでないリンクを追加
+                          if (self.is_same_domain(absolute_link) and 
+                              absolute_link not in self.visited_urls and
+                              not self.should_exclude(absolute_link)):
+                              self.urls_to_visit.append((absolute_link, current_depth + 1))
+                      
+                      # その他のリソースリンクを抽出 (画像、CSS、JS など)
+                      for tag_name, attr in [('img', 'src'), ('link', 'href'), ('script', 'src')]:
+                          for tag in soup.find_all(tag_name, attrs={attr: True}):
+                              resource_url = tag[attr]
+                              absolute_url = self.normalize_url(resource_url, url)
+                              
+                              # 同一ドメインのみ、訪問済みでないリンクを追加
+                              if (self.is_same_domain(absolute_url) and 
+                                  absolute_url not in self.visited_urls and
+                                  not self.should_exclude(absolute_url)):
+                                  # リソースファイルの拡張子を確認
+                                  file_ext = self.get_file_extension(absolute_url)
+                                  if file_ext in self.allowed_file_types:
+                                      self.urls_to_visit.append((absolute_url, current_depth + 1))
+                  
+                  except Exception as e:
+                      print(f"リンク抽出エラー: {url} ({str(e)})")
+
+              def run(self):
+                  """スクレイピングを実行"""
+                  start_time = time.time()
+                  
+                  while self.urls_to_visit:
+                      # 訪問するURLと深度を取得
+                      url, depth = self.urls_to_visit.pop(0)
+                      
+                      # 深度の上限を超えている場合はスキップ
+                      if depth > self.max_depth:
+                          continue
+                      
+                      # ファイルをダウンロード
+                      self.download_file(url, depth)
+                      
+                      # 処理状況を表示（100URLごと）
+                      if len(self.visited_urls) % 100 == 0:
+                          print(f"進捗: {len(self.visited_urls)}ページ処理済み, {len(self.urls_to_visit)}ページ残り")
+                  
+                  # メタデータの更新
+                  self.metadata["end_time"] = datetime.now().isoformat()
+                  self.metadata["duration_seconds"] = time.time() - start_time
+                  
+                  # メタデータの保存
+                  metadata_path = os.path.join(self.output_dir, 'metadata.json')
+                  with open(metadata_path, 'w', encoding='utf-8') as f:
+                      json.dump(self.metadata, f, ensure_ascii=False, indent=2)
+                  
+                  # ダウンロードファイルリストの保存
+                  files_path = os.path.join(self.output_dir, 'files.json')
+                  with open(files_path, 'w', encoding='utf-8') as f:
+                      json.dump(self.downloaded_files, f, ensure_ascii=False, indent=2)
+                  
+                  print("\nスクレイピング完了:")
+                  print(f"- 処理ページ数: {self.metadata['pages_visited']}")
+                  print(f"- ダウンロードファイル数: {self.metadata['files_downloaded']}")
+                  print(f"- 経過時間: {self.metadata['duration_seconds']:.1f}秒")
+
+          if __name__ == "__main__":
+              # コマンドライン引数の処理
+              if len(sys.argv) < 2:
+                  print("使用方法: python scraper.py <URL> [max_depth] [file_types] [exclude_patterns]")
+                  sys.exit(1)
+              
+              start_url = sys.argv[1]
+              max_depth = int(sys.argv[2]) if len(sys.argv) > 2 else 2
+              
+              allowed_file_types = None
+              if len(sys.argv) > 3 and sys.argv[3]:
+                  allowed_file_types = sys.argv[3].split(',')
+              
+              exclude_patterns = None
+              if len(sys.argv) > 4 and sys.argv[4]:
+                  exclude_patterns = sys.argv[4].split(',')
+              
+              # スクレイパーの実行
+              scraper = WebScraper(
+                  start_url=start_url,
+                  max_depth=max_depth,
+                  allowed_file_types=allowed_file_types,
+                  exclude_patterns=exclude_patterns
+              )
+              scraper.run()
+          EOF
+
+      - name: Create web UI script
+        run: |
+          cat > create_ui.py << 'EOF'
+          import os
+          import json
+          from jinja2 import Template
+
+          def create_index_html():
+              """インデックスページを作成"""
+              template_str = """
+          <!DOCTYPE html>
+          <html lang="ja">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Web Scraper - 結果</title>
+              <link rel="stylesheet" href="static/css/style.css">
+          </head>
+          <body>
+              <div class="container">
+                  <h1>Web Scraper - 結果</h1>
+                  
+                  {% if metadata %}
+                  <div class="card">
+                      <h2>スクレイピング情報</h2>
+                      <table>
+                          <tr>
+                              <th>開始URL</th>
+                              <td><a href="{{ metadata.start_url }}" target="_blank">{{ metadata.start_url }}</a></td>
+                          </tr>
+                          <tr>
+                              <th>開始時間</th>
+                              <td>{{ metadata.start_time }}</td>
+                          </tr>
+                          <tr>
+                              <th>終了時間</th>
+                              <td>{{ metadata.end_time }}</td>
+                          </tr>
+                          <tr>
+                              <th>処理時間</th>
+                              <td>{{ "%.2f"|format(metadata.duration_seconds) }} 秒</td>
+                          </tr>
+                          <tr>
+                              <th>訪問ページ数</th>
+                              <td>{{ metadata.pages_visited }}</td>
+                          </tr>
+                          <tr>
+                              <th>ダウンロードファイル数</th>
+                              <td>{{ metadata.files_downloaded }}</td>
+                          </tr>
+                          <tr>
+                              <th>最大深度</th>
+                              <td>{{ metadata.max_depth }}</td>
+                          </tr>
+                          <tr>
+                              <th>許可ファイルタイプ</th>
+                              <td>{{ ", ".join(metadata.allowed_file_types) }}</td>
+                          </tr>
+                          {% if metadata.exclude_patterns %}
+                          <tr>
+                              <th>除外パターン</th>
+                              <td>{{ ", ".join(metadata.exclude_patterns) }}</td>
+                          </tr>
+                          {% endif %}
+                      </table>
+                  </div>
+                  {% endif %}
+                  
+                  {% if files %}
+                  <div class="card">
+                      <h2>ダウンロードファイル ({{ files|length }})</h2>
+                      <div class="search-box">
+                          <input type="text" id="fileSearch" placeholder="ファイル名で検索..." onkeyup="filterFiles()">
+                      </div>
+                      <table id="filesTable">
+                          <thead>
+                              <tr>
+                                  <th>#</th>
+                                  <th>ファイル</th>
+                                  <th>URL</th>
+                                  <th>サイズ</th>
+                                  <th>タイプ</th>
+                                  <th>深度</th>
+                              </tr>
+                          </thead>
+                          <tbody>
+                              {% for file in files %}
+                              <tr>
+                                  <td>{{ loop.index }}</td>
+                                  <td>
+                                      <a href="{{ file.local_path }}" target="_blank">
+                                          {{ file.local_path.split('/')[-1] }}
+                                      </a>
+                                  </td>
+                                  <td>
+                                      <a href="{{ file.url }}" target="_blank" class="url-link">
+                                          {{ file.url }}
+                                      </a>
+                                  </td>
+                                  <td>{{ format_size(file.size_bytes) }}</td>
+                                  <td>{{ file.content_type }}</td>
+                                  <td>{{ file.depth }}</td>
+                              </tr>
+                              {% endfor %}
+                          </tbody>
+                      </table>
+                  </div>
+                  {% else %}
+                  <div class="card">
+                      <h2>ファイルがダウンロードされていません</h2>
+                      <p>スクレイピングが完了していないか、ファイルがダウンロードされませんでした。</p>
+                  </div>
+                  {% endif %}
+              </div>
+              
+              <script>
+                  function filterFiles() {
+                      const input = document.getElementById('fileSearch');
+                      const filter = input.value.toLowerCase();
+                      const table = document.getElementById('filesTable');
+                      const tr = table.getElementsByTagName('tr');
+                      
+                      for (let i = 1; i < tr.length; i++) {
+                          const tds = tr[i].getElementsByTagName('td');
+                          let display = false;
+                          
+                          for (let j = 0; j < tds.length; j++) {
+                              const cell = tds[j];
+                              if (cell) {
+                                  const txtValue = cell.textContent || cell.innerText;
+                                  if (txtValue.toLowerCase().indexOf(filter) > -1) {
+                                      display = true;
+                                      break;
+                                  }
+                              }
+                          }
+                          
+                          tr[i].style.display = display ? '' : 'none';
+                      }
+                  }
+              </script>
+          </body>
+          </html>
+          """
+              
+              # メタデータの読み込み
+              metadata = None
+              if os.path.exists('scraped_data/metadata.json'):
+                  with open('scraped_data/metadata.json', 'r', encoding='utf-8') as f:
+                      metadata = json.load(f)
+              
+              # ファイルリストの読み込み
+              files = []
+              if os.path.exists('scraped_data/files.json'):
+                  with open('scraped_data/files.json', 'r', encoding='utf-8') as f:
+                      files = json.load(f)
+              
+              # ファイルサイズフォーマット関数
+              def format_size(size_bytes):
+                  """ファイルサイズを人間が読みやすい形式にフォーマット"""
+                  for unit in ['B', 'KB', 'MB', 'GB']:
+                      if size_bytes < 1024.0:
+                          return f"{size_bytes:.2f} {unit}"
+                      size_bytes /= 1024.0
+                  return f"{size_bytes:.2f} TB"
+              
+              # テンプレートレンダリング
+              template = Template(template_str)
+              html_content = template.render(
+                  metadata=metadata,
+                  files=files,
+                  format_size=format_size
+              )
+              
+              # index.htmlを保存
+              with open('scraped_data/index.html', 'w', encoding='utf-8') as f:
+                  f.write(html_content)
+              
+              # CSSファイルの作成
+              os.makedirs('scraped_data/static/css', exist_ok=True)
+              
+              css_content = """
+          body {
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+              line-height: 1.6;
+              color: #333;
+              background-color: #f5f5f5;
+              margin: 0;
+              padding: 20px;
+          }
+
+          .container {
+              max-width: 1200px;
+              margin: 0 auto;
+          }
+
+          h1 {
+              text-align: center;
+              color: #2c3e50;
+              margin-bottom: 30px;
+          }
+
+          h2 {
+              color: #3498db;
+              margin-top: 0;
+          }
+
+          .card {
+              background: white;
+              border-radius: 8px;
+              box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+              padding: 20px;
+              margin-bottom: 30px;
+          }
+
+          table {
+              width: 100%;
+              border-collapse: collapse;
+              margin-top: 15px;
+          }
+
+          th, td {
+              padding: 12px 15px;
+              border-bottom: 1px solid #ddd;
+              text-align: left;
+          }
+
+          th {
+              background-color: #f8f9fa;
+              font-weight: 600;
+          }
+
+          tr:hover {
+              background-color: #f5f5f5;
+          }
+
+          a {
+              color: #3498db;
+              text-decoration: none;
+          }
+
+          a:hover {
+              text-decoration: underline;
+          }
+
+          .url-link {
+              display: block;
+              max-width: 300px;
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+          }
+
+          .search-box {
+              margin-bottom: 15px;
+          }
+
+          .search-box input {
+              width: 100%;
+              padding: 10px;
+              border: 1px solid #ddd;
+              border-radius: 4px;
+              font-size: 16px;
+          }
+          """
+              
+              with open('scraped_data/static/css/style.css', 'w', encoding='utf-8') as f:
+                  f.write(css_content)
+              
+              print("index.html and CSS created successfully!")
+
+          if __name__ == "__main__":
+              create_index_html()
+          EOF
+
+      - name: Run scraper
+        run: |
+          python scraper.py ${{ github.event.inputs.target_url }} ${{ github.event.inputs.max_depth }} ${{ github.event.inputs.file_types }} "${{ github.event.inputs.exclude_patterns }}"
+
+      - name: Create UI
+        run: |
+          python create_ui.py
+
+      - name: Create GitHub Pages index
+        run: |
+          cp -r scraped_data/* .
+
+      - name: Deploy to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@4.1.5
+        with:
+          branch: gh-pages
+          folder: .
+          clean: true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: scraped-data
+          path: scraped_data
