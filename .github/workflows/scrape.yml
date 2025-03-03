@@ -323,8 +323,106 @@ jobs:
           cat > create_ui.py << 'EOF'
           import os
           import json
+          import zipfile
           from jinja2 import Template
 
+          def create_download_zips():
+              """HTMLファイルとその他のファイルタイプごとにZIPファイルを作成（フラット構造）"""
+              # ファイルリストの読み込み
+              if not os.path.exists('scraped_data/files.json'):
+                  print("ファイルリストが見つかりません")
+                  return []
+              
+              with open('scraped_data/files.json', 'r', encoding='utf-8') as f:
+                  files = json.load(f)
+              
+              # ファイルタイプごとにグループ化
+              file_types = {}
+              for file_info in files:
+                  path = file_info["local_path"]
+                  if not os.path.exists(path):
+                      continue
+                      
+                  # ファイルタイプを判定
+                  if "content_type" in file_info and file_info["content_type"]:
+                      content_type = file_info["content_type"].split(';')[0].strip().split('/')[-1]
+                  else:
+                      ext = os.path.splitext(path)[1].lower()
+                      content_type = ext[1:] if ext.startswith('.') else ext
+                      if not content_type:
+                          content_type = "unknown"
+                  
+                  if content_type not in file_types:
+                      file_types[content_type] = []
+                  
+                  file_types[content_type].append(path)
+              
+              # HTMLファイルは常にZIP化
+              if "html" not in file_types:
+                  file_types["html"] = []
+                  for file_info in files:
+                      path = file_info["local_path"]
+                      if path.endswith('.html') and os.path.exists(path):
+                          file_types["html"].append(path)
+              
+              # ZIPファイルを作成
+              zip_files = []
+              for file_type, file_paths in file_types.items():
+                  if not file_paths:
+                      continue
+                      
+                  zip_name = f"scraped_data/{file_type}_files.zip"
+                  with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                      for file_path in file_paths:
+                          # ファイル名だけを取得して、フラットな構造でZIPに追加
+                          filename = os.path.basename(file_path)
+                          # 同名のファイルがある場合はユニークな名前にする
+                          counter = 1
+                          base_name, ext = os.path.splitext(filename)
+                          while filename in zipf.namelist():
+                              filename = f"{base_name}_{counter}{ext}"
+                              counter += 1
+                          zipf.write(file_path, filename)
+                  
+                  zip_info = {
+                      "type": file_type,
+                      "path": zip_name,
+                      "count": len(file_paths),
+                      "size_bytes": os.path.getsize(zip_name)
+                  }
+                  zip_files.append(zip_info)
+              
+              # 全ファイルをまとめたZIPを作成
+              all_files_zip = "scraped_data/all_files.zip"
+              with zipfile.ZipFile(all_files_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                  for file_info in files:
+                      path = file_info["local_path"]
+                      if os.path.exists(path):
+                          # ファイル名だけを取得して、フラットな構造でZIPに追加
+                          filename = os.path.basename(path)
+                          # 同名のファイルがある場合はユニークな名前にする
+                          counter = 1
+                          base_name, ext = os.path.splitext(filename)
+                          while filename in zipf.namelist():
+                              filename = f"{base_name}_{counter}{ext}"
+                              counter += 1
+                          zipf.write(path, filename)
+              
+              # まとめZIPの情報を追加
+              total_count = sum(len(files) for files in file_types.values())
+              zip_files.append({
+                  "type": "all",
+                  "path": all_files_zip,
+                  "count": total_count,
+                  "size_bytes": os.path.getsize(all_files_zip)
+              })
+              
+              # ZIPファイル情報をJSONで保存
+              with open('scraped_data/zip_files.json', 'w', encoding='utf-8') as f:
+                  json.dump(zip_files, f, ensure_ascii=False, indent=2)
+              
+              return zip_files
+          
           def create_index_html():
               """インデックスページを作成"""
               template_str = """
@@ -339,6 +437,20 @@ jobs:
           <body>
               <div class="container">
                   <h1>Web Scraper - 結果</h1>
+                  
+                  {% if zip_files %}
+                  <div class="card download-section">
+                      <h2>ダウンロード</h2>
+                      <div class="download-buttons">
+                          {% for zip_info in zip_files %}
+                          <a href="{{ zip_info.path }}" class="download-button" download>
+                              {{ zip_info.type }}ファイル一括ダウンロード
+                              <span class="download-info">({{ zip_info.count }}ファイル, {{ format_size(zip_info.size_bytes) }})</span>
+                          </a>
+                          {% endfor %}
+                      </div>
+                  </div>
+                  {% endif %}
                   
                   {% if metadata %}
                   <div class="card">
@@ -408,7 +520,7 @@ jobs:
                               <tr>
                                   <td>{{ loop.index }}</td>
                                   <td>
-                                      <a href="{{ file.local_path }}" target="_blank">
+                                      <a href="{{ file.local_path }}" target="_blank" download>
                                           {{ file.local_path.split('/')[-1] }}
                                       </a>
                                   </td>
@@ -463,6 +575,9 @@ jobs:
           </html>
           """
               
+              # ZIPファイルの作成
+              zip_files = create_download_zips()
+              
               # メタデータの読み込み
               metadata = None
               if os.path.exists('scraped_data/metadata.json'):
@@ -489,6 +604,7 @@ jobs:
               html_content = template.render(
                   metadata=metadata,
                   files=files,
+                  zip_files=zip_files,
                   format_size=format_size
               )
               
@@ -582,6 +698,41 @@ jobs:
               border-radius: 4px;
               font-size: 16px;
           }
+          
+          .download-section {
+              margin-bottom: 30px;
+          }
+          
+          .download-buttons {
+              display: flex;
+              flex-wrap: wrap;
+              gap: 15px;
+              margin-top: 15px;
+          }
+          
+          .download-button {
+              display: block;
+              background-color: #3498db;
+              color: white;
+              padding: 12px 20px;
+              border-radius: 6px;
+              text-decoration: none;
+              font-weight: 600;
+              text-align: center;
+              transition: background-color 0.3s ease;
+          }
+          
+          .download-button:hover {
+              background-color: #2980b9;
+              text-decoration: none;
+          }
+          
+          .download-info {
+              display: block;
+              font-size: 0.8em;
+              opacity: 0.8;
+              margin-top: 5px;
+          }
           """
               
               with open('scraped_data/static/css/style.css', 'w', encoding='utf-8') as f:
@@ -595,39 +746,4 @@ jobs:
 
       - name: Run scraper
         run: |
-          python scraper.py ${{ github.event.inputs.target_url }} ${{ github.event.inputs.max_depth }} ${{ github.event.inputs.file_types }} "${{ github.event.inputs.exclude_patterns }}"
-
-      - name: Create UI
-        run: |
-          python create_ui.py
-
-      - name: Copy scraped data to root
-        run: |
-          cp -r scraped_data/* .
-
-      # GitHub Pagesへのデプロイ - GitHub公式のアクションを使用
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
-
-      - name: Build with Jekyll
-        uses: actions/jekyll-build-pages@v1
-        with:
-          source: ./
-          destination: ./_site
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ./_site
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      # スクレイピング結果をアーティファクトとしても保存
-      - name: Upload scraped data as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: scraped-data
-          path: scraped_data
-          retention-days: 7
+          python scraper.py ${{
