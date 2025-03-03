@@ -23,6 +23,12 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    # GitHub Pagesへデプロイするための明示的な権限設定
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -595,19 +601,33 @@ jobs:
         run: |
           python create_ui.py
 
-      - name: Create GitHub Pages index
+      - name: Copy scraped data to root
         run: |
           cp -r scraped_data/* .
 
-      - name: Deploy to GitHub Pages
-        uses: JamesIves/github-pages-deploy-action@v4
-        with:
-          branch: gh-pages
-          folder: .
-          clean: true
+      # GitHub Pagesへのデプロイ - GitHub公式のアクションを使用
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
 
-      - name: Upload artifacts
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # スクレイピング結果をアーティファクトとしても保存
+      - name: Upload scraped data as artifact
         uses: actions/upload-artifact@v4
         with:
           name: scraped-data
           path: scraped_data
+          retention-days: 7
